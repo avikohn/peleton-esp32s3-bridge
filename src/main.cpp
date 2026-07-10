@@ -60,6 +60,8 @@
 #define MULTICAST_PORT     41234  // structured heartbeat JSON (target is runtime-configurable)
 #define DEBUG_LOG_PORT     41235  // free-text debug log lines, same group, always fixed
 #define CONTROL_PORT       41236  // control messages in, same group, always fixed
+#define BLE_MIRROR_PORT    41237  // raw CPS Measurement bytes, same rate as BLE notify — lets you
+                                   // diff what's actually going out over BLE without a BLE client
 
 // --- Pin config ---
 #define PELOTON_RX_PIN  12
@@ -136,6 +138,11 @@ static uint32_t lastNotifyMs    = 0;
 static uint32_t lastCadenceMs   = 0;
 static uint32_t rxByteCount     = 0;  // total bytes seen on the bike's TX line
 
+static uint32_t lastValidMsgMs  = 0;  // millis() of the last fully-valid (checksum+footer+digits ok) frame on PELOTON_RX_PIN, 0 = none yet
+static uint32_t lastRxStatusMs  = 0;
+#define RX_STATUS_INTERVAL_MS 1000
+#define RX_VALID_WINDOW_MS    2000
+
 // Runtime-controllable via multicast control messages — see header comment.
 static bool      headUnitMode          = false;  // safe default; the mode jumper takes over on first loop()
 static IPAddress broadcastMulticastIp  = MULTICAST_IP;  // where the heartbeat JSON goes
@@ -146,9 +153,15 @@ static IPAddress broadcastMulticastIp  = MULTICAST_IP;  // where the heartbeat J
 // consolidating is a cheap way to test that theory.
 static WiFiUDP      sharedUdp;
 
-// Prints locally (same as before) and, if WiFi's up, also broadcasts the same
-// line as a UDP packet to DEBUG_LOG_PORT — lets you tail logs without a USB
-// cable. Used for the hex dump too, so expect real traffic to be chatty.
+// ponytail: disabled — was firing on every hex-dump/decoded-frame line during
+// active polling, chattiest UDP send in the firmware. Flip to true (or wire
+// up to the control channel) to get remote log tailing back.
+static bool debugLogMulticast = false;
+
+// Prints locally (same as before) and, if enabled and WiFi's up, also
+// broadcasts the same line as a UDP packet to DEBUG_LOG_PORT — lets you tail
+// logs without a USB cable. Used for the hex dump too, so expect real traffic
+// to be chatty.
 static void debugLog(const char* fmt, ...) {
     char buf[192];
     va_list args;
@@ -156,9 +169,12 @@ static void debugLog(const char* fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    Serial.println(buf);
+    // `if (Serial)` checks whether a USB host actually has the CDC port open
+    // (DTR asserted) — skips the write instead of blocking/dropping into a
+    // full TX buffer when nothing's attached to read it.
+    if (Serial) Serial.println(buf);
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (debugLogMulticast && WiFi.status() == WL_CONNECTED) {
         sharedUdp.beginPacket(MULTICAST_IP, DEBUG_LOG_PORT);
         sharedUdp.write((const uint8_t*)buf, strlen(buf));
         sharedUdp.write('\n');  // so raw listeners (socat, nc) show one line per packet
@@ -494,6 +510,15 @@ static void setupControlListener() {
 // BLE notification
 // ---------------------------------------------------------------------------
 
+// Mirrors the exact bytes just sent over BLE notify to a fixed multicast port,
+// so you can diff what actually went out over the air without a BLE client.
+static void broadcastBleMirror(const uint8_t* pkt, size_t len) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    sharedUdp.beginPacket(MULTICAST_IP, BLE_MIRROR_PORT);
+    sharedUdp.write(pkt, len);
+    sharedUdp.endPacket();
+}
+
 static void notifyBLE() {
     // CPS Measurement packet:
     //   uint16 flags
@@ -509,6 +534,7 @@ static void notifyBLE() {
 
     cpsMeasurement->setValue(pkt, sizeof(pkt));
     cpsMeasurement->notify();
+    broadcastBleMirror(pkt, sizeof(pkt));
     debugLog("[notify] power=%d crankRevs=%u crankTime=%u", currentPower, crankRevs, lastCrankTime);
 }
 
@@ -663,7 +689,6 @@ static void pollBikeTraffic() {
     while (Serial2.available()) {
         uint8_t b = Serial2.read();
         rxByteCount++;
-        ledFlash(10, 10, 0);  // yellow: any raw byte on the line, decoded or not
         hexDumpByte(b);
 
         if (pos == 0 && b != PKT_RESPONSE_HEADER) continue;
@@ -715,6 +740,7 @@ static void pollBikeTraffic() {
             place *= 10;
         }
         if (digitsOk) {
+            lastValidMsgMs = millis();
             if (millis() < LED_STATUS_WINDOW_MS) ledFlash(0, 10, 10);  // cyan: bike data received
             applyMeasurement(echoCmd, value);
         } else {
@@ -755,6 +781,13 @@ void loop() {
 
     ArduinoOTA.handle();
     ledUpdate();
+
+    if (now - lastRxStatusMs >= RX_STATUS_INTERVAL_MS) {
+        lastRxStatusMs = now;
+        if (lastValidMsgMs != 0 && now - lastValidMsgMs <= RX_VALID_WINDOW_MS) {
+            ledFlash(20, 0, 0);  // red: bike link alive (valid frame within last 2s)
+        }
+    }
 
     if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
