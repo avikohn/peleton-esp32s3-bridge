@@ -67,14 +67,16 @@ Decodes the bike's resistance calibration table (31 points, sent at bike boot) a
 
 ```
 Peloton handlepost cable (TRRS)
-  Tip    → HU TX (ignore — we don't need to send anything*)
-  Ring1  → Bike TX  ──→  MAX3232 R1IN  →  MAX3232 R1OUT  →  ESP32 GPIO 12
-  Ring2  → GND      ──→  ESP32 GND
-  Sleeve → GND      ──→  ESP32 GND
+  Ring1  → Bike TX (RS-232)  ──→  MAX3232 R1IN → MAX3232 R1OUT (RXD)  ──→  ESP32 GPIO 12 (UART2 RX)
+  Ring2  → GND               ──→  ESP32 GND
+  Sleeve → GND               ──→  ESP32 GND
+  Tip    → Bike RX (RS-232)  ←──  MAX3232 T1OUT ← MAX3232 T1IN (TXD)  ←──  ESP32 GPIO 13 (UART2 TX)*
 
-* ESP32 TX (GPIO 13) → MAX3232 T1IN → MAX3232 T1OUT → Tip (TRRS)
-  Required for head-unit mode (ESP32 sends poll requests)
+* GPIO 13 / TXD only needed in head-unit mode (ESP32 actively polls the bike).
+  In headless mode, omit this wire — the tablet drives Tip instead.
 ```
+
+**Summary:** MAX3232 breakout **RXD** pin → GPIO 12 (inbound from bike), **TXD** pin → GPIO 13 (outbound to bike).
 
 Mode jumper:
 ```
