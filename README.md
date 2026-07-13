@@ -6,13 +6,15 @@ Inspired by [ihaque's excellent PeloMon reverse engineering](https://ihaque.org/
 
 ## Features
 
-### Two operating modes, switchable without reflashing
+### Auto-detecting polling mode
 
-**Headless mode** (default) — the tablet stays connected and drives the bike. The ESP32 passively listens on the bike's TX line and never transmits. Safe starting point: no bus contention possible.
+The bridge starts in **headless mode** (listen-only) and auto-detects whether a tablet is present:
 
-**Head-unit mode** — the ESP32 sends its own poll requests and the tablet must be disconnected. Required if you don't have a tablet or want the bridge to work standalone.
+1. If the bike's TX line goes silent for >1 s, it switches to **active polling** (sends its own requests).
+2. If polling gets no response either, it enters a brief **probe** window.
+3. If bytes appear during probe, a tablet was found — switches back to headless. Otherwise stays polling.
 
-Switch modes at runtime with a hardware jumper (short GPIO5 to GPIO4) — takes effect immediately on the next loop, no reboot needed. GPIO4 is driven low as a local ground, so no actual GND wire is required.
+No configuration needed. If you run without a tablet, the bridge takes over automatically.
 
 ### BLE Cycling Power Service
 
@@ -24,20 +26,19 @@ Correctly implements the CPS crank timestamp spec so cadence reads accurately on
 
 ### Multicast debug broadcast
 
-All log output is broadcast over UDP multicast (239.255.42.99) simultaneously with the USB serial console — no cable needed to monitor a mounted device:
+All multicast is sent to 239.255.42.99. Listen from any machine on the LAN:
 
-| Port  | Content |
-|-------|---------|
-| 41234 | Heartbeat JSON every 5 s: `{"timestamp":…,"cadence":…,"power":…,"resistance":…,"rxBytes":…}` |
-| 41235 | Free-text debug log lines (same content as USB serial) |
-
-Listen from any machine on the LAN:
+| Port  | Content | Always on? |
+|-------|---------|------------|
+| 41234 | Heartbeat JSON every 5 s: `{"timestamp":…,"cadence":…,"power":…,"resistance":…,"rxBytes":…,"calib":…}` | Yes (when WiFi connected) |
+| 41235 | Free-text debug log lines | No — set `debugLogMulticast = true` in firmware |
+| 41236 | Raw CPS Measurement bytes (same cadence as BLE notify) | Yes (when WiFi connected) |
 
 ```bash
 # Heartbeat JSON
 socat UDP4-RECVFROM:41234,ip-add-membership=239.255.42.99:0.0.0.0,reuseaddr -
 
-# Debug log stream
+# Debug log stream (requires debugLogMulticast = true)
 socat UDP4-RECVFROM:41235,ip-add-membership=239.255.42.99:0.0.0.0,reuseaddr -
 ```
 
@@ -78,12 +79,7 @@ Peloton handlepost cable (TRRS)
 
 **Summary:** MAX3232 breakout **RXD** pin → GPIO 12 (inbound from bike), **TXD** pin → GPIO 13 (outbound to bike).
 
-Mode jumper:
-```
-GPIO4 → GPIO5   (short = head-unit mode, open = headless)
-```
-
-> **Note:** In head-unit mode the tablet must be disconnected — both driving the Tip line simultaneously causes bus contention.
+> **Note:** In active polling mode the tablet must be disconnected — both driving the Tip line simultaneously causes bus contention.
 
 ### Tap method (non-destructive)
 

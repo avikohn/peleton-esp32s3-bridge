@@ -4,21 +4,15 @@
  * Reads cadence + power off the Peloton bike's serial line and rebroadcasts
  * them as a standard BLE Cycling Power Service (CPS) device.
  *
- * Two polling modes, runtime-switchable (see `headUnitMode` below, default
- * false) via control multicast — no reflash needed (control listener is
- * currently disabled pending a stability investigation, see setup()):
- *   headless (false) — tablet stays connected and polls the bike; ESP32
- *       only listens on the bike's TX (response) line and never transmits.
- *   head unit (true) — ESP32 sends its own requests; tablet must be
- *       disconnected, since both driving the Tip line at once causes bus
- *       contention that breaks communication for both.
- * Either way, incoming responses are parsed the same way, since each one
- * is self-describing (echoes the command it's answering).
+ * Polling mode is auto-detected: starts headless (listen-only), switches to
+ * active polling if RX goes silent (no tablet present), then probes briefly
+ * before committing. Either way responses are parsed identically — each one
+ * echoes the command it's answering.
  *
  * Hardware:
  *   - Peloton TRRS cable → MAX3232 breakout → ESP32 UART2
- *   - TRRS Ring1 (Bike TX) → MAX3232 R1IN → MAX3232 R1OUT → GPIO 12 (RX)
- *   - TRRS Tip (Bike RX)   → MAX3232 T1OUT → MAX3232 T1IN → GPIO 13 (TX)
+ *   - TRRS Ring1 (Bike TX) → MAX3232 R1IN → MAX3232 R1OUT (RXD) → GPIO 12
+ *   - TRRS Tip (Bike RX)   → MAX3232 T1IN (TXD) → MAX3232 T1OUT → GPIO 13
  *   - TRRS Ring2/Sleeve (GND) → ESP32 GND
  *
  * Protocol (from ihaque.org/posts/2020/10/15/pelomon-part-i-decoding-peloton):
@@ -26,16 +20,6 @@
  *   Response: F1 [echo_cmd] [len] [ascii_digits...] [checksum] F6
  *   Cadence (0x41): payload = ASCII RPM
  *   Power   (0x44): payload = ASCII deciwatts (divide by 10 for watts)
- *
- * Remote control: send a JSON object with any subset of these fields as a
- * UDP packet to the control multicast port (same group as everything else,
- * CONTROL_PORT):
- *   {"mode": "head" | "headless", "multicast": "a.b.c.d"}
- * "mode" toggles active polling; "multicast" redirects where the heartbeat
- * JSON is broadcast.
- * ponytail: the multicast control listener has no auth at all — anyone on
- * the LAN can send it commands. Fine for a home network, not for anything
- * more exposed.
  */
 
 #include <Arduino.h>
@@ -58,10 +42,9 @@
 // 239.255.x.x is administratively-scoped (private-use) multicast — safe to
 // pick an arbitrary address/port here without colliding with anything routed.
 #define MULTICAST_IP       IPAddress(239, 255, 42, 99)
-#define MULTICAST_PORT     41234  // structured heartbeat JSON (target is runtime-configurable)
-#define DEBUG_LOG_PORT     41235  // free-text debug log lines, same group, always fixed
-#define CONTROL_PORT       41236  // control messages in, same group, always fixed
-#define BLE_MIRROR_PORT    41237  // raw CPS Measurement bytes, same rate as BLE notify — lets you
+#define MULTICAST_PORT     41234  // structured heartbeat JSON
+#define DEBUG_LOG_PORT     41235  // free-text debug log lines (opt-in: set debugLogMulticast = true)
+#define BLE_MIRROR_PORT    41236  // raw CPS Measurement bytes, same rate as BLE notify — lets you
                                    // diff what's actually going out over BLE without a BLE client
 
 // --- Pin config ---
@@ -149,9 +132,25 @@ static uint32_t lastRxStatusMs  = 0;
 #define RX_STATUS_INTERVAL_MS 1000
 #define RX_VALID_WINDOW_MS    2000
 
-// Runtime-controllable via multicast control messages — see header comment.
-static bool      headUnitMode          = false;  // safe default; the mode jumper takes over on first loop()
-static IPAddress broadcastMulticastIp  = MULTICAST_IP;  // where the heartbeat JSON goes
+// Auto-detect polling mode: start headless, switch to polling if RX goes silent,
+// probe briefly if polling stops working (to distinguish contention from bike-off).
+enum AutoMode { AUTO_HEADLESS, AUTO_POLLING, AUTO_PROBE };
+static AutoMode  autoMode             = AUTO_HEADLESS;
+static uint32_t  autoModeEnteredMs    = 0;  // set in setup() to millis()
+static uint32_t  probeRxCountAtEntry  = 0;  // rxByteCount snapshot when probe starts
+
+#define AUTO_SILENCE_MS  1000  // RX silence → switch headless→polling (or polling→probe)
+#define AUTO_SETTLE_MS    500  // grace period after entering POLLING before checking silence
+#define AUTO_PROBE_MS    2000  // probe window before concluding head unit is absent
+
+static const char* autoModeName(AutoMode m) {
+    switch (m) {
+        case AUTO_HEADLESS: return "headless";
+        case AUTO_POLLING:  return "polling";
+        case AUTO_PROBE:    return "probe";
+    }
+    return "?";
+}
 
 // Single shared socket for all multicast traffic (send and receive) — three
 // separate WiFiUDP objects (two send-only, one joined-for-receive) may have
@@ -186,75 +185,39 @@ static void debugLog(const char* fmt, ...) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Remote control (control multicast)
-// ---------------------------------------------------------------------------
 
-// Applies any subset of {"mode", "multicast"} present in the JSON.
-static void applyControlMessage(const char* json, size_t len) {
-    StaticJsonDocument<128> doc;
-    DeserializationError err = deserializeJson(doc, json, len);
-    if (err) {
-        debugLog("[control] bad JSON: %s", err.c_str());
-        return;
-    }
-
-    if (doc.containsKey("mode")) {
-        const char* mode = doc["mode"];
-        if (strcmp(mode, "head") == 0) {
-            headUnitMode = true;
-            debugLog("[control] mode -> head");
-        } else if (strcmp(mode, "headless") == 0) {
-            headUnitMode = false;
-            debugLog("[control] mode -> headless");
-        } else {
-            debugLog("[control] unknown mode: %s", mode);
+static void updateAutoMode(uint32_t now) {
+    switch (autoMode) {
+        case AUTO_HEADLESS: {
+            uint32_t silenceRef = (lastValidMsgMs > autoModeEnteredMs) ? lastValidMsgMs : autoModeEnteredMs;
+            if (now - silenceRef > AUTO_SILENCE_MS) {
+                autoMode = AUTO_POLLING;
+                autoModeEnteredMs = now;
+                debugLog("[auto] headless → polling");
+            }
+            break;
         }
-    }
-
-    if (doc.containsKey("multicast")) {
-        IPAddress newIp;
-        const char* addr = doc["multicast"];
-        if (newIp.fromString(addr)) {
-            broadcastMulticastIp = newIp;
-            debugLog("[control] multicast -> %s", addr);
-        } else {
-            debugLog("[control] bad multicast address: %s", addr);
-        }
-    }
-
-}
-
-// Non-blocking: only checks for one waiting packet per call, same pattern as
-// pollBikeTraffic — call every loop().
-static void checkControlMulticast() {
-    int packetSize = sharedUdp.parsePacket();
-    if (packetSize <= 0) return;
-
-    char buf[128];
-    int n = sharedUdp.read(buf, sizeof(buf) - 1);
-    if (n <= 0) return;
-    buf[n] = '\0';
-    applyControlMessage(buf, n);
-}
-
-// ---------------------------------------------------------------------------
-// Physical mode jumper
-// ---------------------------------------------------------------------------
-
-static void setupModeJumper() {
-    pinMode(MODE_JUMPER_GND_PIN, OUTPUT);
-    digitalWrite(MODE_JUMPER_GND_PIN, LOW);
-    pinMode(MODE_JUMPER_SENSE_PIN, INPUT_PULLUP);
-}
-
-// Checked every loop() so the jumper works live — no reflash or reboot needed
-// to switch modes, just add/remove the wire.
-static void checkModeJumper() {
-    bool jumpered = digitalRead(MODE_JUMPER_SENSE_PIN) == LOW;
-    if (jumpered != headUnitMode) {
-        headUnitMode = jumpered;
-        debugLog("[jumper] mode -> %s", headUnitMode ? "head" : "headless");
+        case AUTO_POLLING:
+            if (now - autoModeEnteredMs > AUTO_SETTLE_MS &&
+                lastValidMsgMs < autoModeEnteredMs &&
+                now - autoModeEnteredMs > AUTO_SILENCE_MS) {
+                autoMode = AUTO_PROBE;
+                autoModeEnteredMs = now;
+                probeRxCountAtEntry = rxByteCount;
+                debugLog("[auto] polling → probe (no response)");
+            }
+            break;
+        case AUTO_PROBE:
+            if (rxByteCount > probeRxCountAtEntry) {
+                autoMode = AUTO_HEADLESS;
+                autoModeEnteredMs = now;
+                debugLog("[auto] probe → headless (head unit detected)");
+            } else if (now - autoModeEnteredMs > AUTO_PROBE_MS) {
+                autoMode = AUTO_POLLING;
+                autoModeEnteredMs = now;
+                debugLog("[auto] probe → polling");
+            }
+            break;
     }
 }
 
@@ -486,20 +449,12 @@ static void broadcastHeartbeatMulticast() {
                         "{\"timestamp\":%lu,\"cadence\":%u,\"power\":%d,\"resistance\":%u,\"rxBytes\":%lu,\"calib\":%u}",
                         (unsigned long)time(nullptr), currentCadence, currentPower, currentResistance, rxByteCount, calibCount);
 
-    sharedUdp.beginPacket(broadcastMulticastIp, MULTICAST_PORT);
+    sharedUdp.beginPacket(MULTICAST_IP, MULTICAST_PORT);
     sharedUdp.write((const uint8_t*)payload, len);
     sharedUdp.write('\n');  // so raw listeners (socat, nc) show one line per packet
     if (!sharedUdp.endPacket()) {
         debugLog("Multicast heartbeat send failed");
     }
-}
-
-// Joins the fixed control multicast group/port — this address never changes
-// at runtime (only broadcastMulticastIp, the *send* target, does), so there's
-// no chicken-and-egg problem of losing the ability to receive new commands.
-// Using the same shared socket for sends too, per the single-socket theory.
-static void setupControlListener() {
-    sharedUdp.beginMulticast(MULTICAST_IP, CONTROL_PORT);
 }
 
 // ---------------------------------------------------------------------------
@@ -793,11 +748,10 @@ void setup() {
 
     Serial2.begin(PELOTON_BAUD, SERIAL_8N1, PELOTON_RX_PIN, PELOTON_TX_PIN);
     loadCalibration();
+    autoModeEnteredMs = millis();
 
     setupBLE();
     setupOTA();
-    // setupControlListener();  // ponytail: disabled again — reliably causes instability, needs USB-console root cause
-    setupModeJumper();
 
     Serial.println("Ready — listening for bike traffic");
 }
@@ -818,11 +772,10 @@ void loop() {
     if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
         badFrameCount = 0;  // reset so bad-frame dumps don't go permanently silent
-        debugLog("[heartbeat] Cadence=%d RPM  Power=%d W  Resist=%d%%  TXbytes=%lu  RXbytes=%lu  GPIO%d=%s  Mode=%s  Jumper=%s  Built=%s",
+        debugLog("[heartbeat] Cadence=%d RPM  Power=%d W  Resist=%d%%  TXbytes=%lu  RXbytes=%lu  GPIO%d=%s  Mode=%s  Built=%s",
                  currentCadence, currentPower, currentResistance, txByteCount, rxByteCount, PELOTON_RX_PIN,
                  digitalRead(PELOTON_RX_PIN) ? "HIGH" : "LOW",
-                 headUnitMode ? "head" : "headless",
-                 digitalRead(MODE_JUMPER_SENSE_PIN) ? "open" : "shorted",
+                 autoModeName(autoMode),
                  __DATE__ " " __TIME__);
         broadcastHeartbeatMulticast();
     }
@@ -832,13 +785,12 @@ void loop() {
         notifyBLE();
     }
 
-    if (headUnitMode && now - lastPollMs >= POLL_INTERVAL_MS) {
+    if (autoMode == AUTO_POLLING && now - lastPollMs >= POLL_INTERVAL_MS) {
         lastPollMs = now;
         sendPollRequest();
     }
 
-    // checkControlMulticast();  // ponytail: disabled again — reliably causes instability, needs USB-console root cause
-    checkModeJumper();
+    updateAutoMode(now);
 
     pollBikeTraffic();
 }
