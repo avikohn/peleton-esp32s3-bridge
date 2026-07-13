@@ -47,6 +47,7 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include "secrets.h"
 
 #define WIFI_CONNECT_TIMEOUT_MS 10000  // don't block bike/BLE startup forever if WiFi's unavailable
@@ -122,14 +123,19 @@
 #define DIS_MANUFACTURER_UUID ((uint16_t)0x2A29)
 #define DIS_MODEL_UUID        ((uint16_t)0x2A24)
 
-// CPS flags: bit 5 = Crank Revolution Data Present
-#define CPS_FLAGS_CRANK_DATA  0x0020
+// CPS Measurement flags
+#define CPS_FLAGS_CRANK_DATA     0x0020  // bit 5: Crank Revolution Data Present
+// Bits 0+1: Pedal Power Balance Present + Reference=Left. We repurpose this
+// field to carry resistance % (0-100 → raw 0-200 at 0.5% resolution) so a
+// CIQ data field can display it without any extra BLE connection.
+#define CPS_FLAGS_PEDAL_BALANCE  0x0003
 
 // --- State ---
 static NimBLECharacteristic* cpsMeasurement = nullptr;
 static int16_t  currentPower      = 0;   // watts
 static uint16_t currentCadence    = 0;   // RPM
-static uint8_t  currentResistance = 0;   // 0-100 (serial log only; not in CPS)
+static uint8_t  currentResistance = 0;   // 0-100% (requires calibration table)
+static uint8_t  calibCount        = 0;   // 0-31; 31 = table full, resistance valid
 static uint16_t crankRevs         = 0;   // cumulative crank revolutions
 static uint16_t lastCrankTime     = 0;   // in 1/1024 sec units
 
@@ -153,9 +159,7 @@ static IPAddress broadcastMulticastIp  = MULTICAST_IP;  // where the heartbeat J
 // consolidating is a cheap way to test that theory.
 static WiFiUDP      sharedUdp;
 
-// ponytail: disabled — was firing on every hex-dump/decoded-frame line during
-// active polling, chattiest UDP send in the firmware. Flip to true (or wire
-// up to the control channel) to get remote log tailing back.
+// ponytail: disabled — chatty over UDP during active polling. Flip true to remote-tail logs.
 static bool debugLogMulticast = false;
 
 // Prints locally (same as before) and, if enabled and WiFi's up, also
@@ -374,18 +378,10 @@ static void setupBLE() {
         NimBLEUUID(CPS_FEATURE_UUID),
         NIMBLE_PROPERTY::READ
     );
-    // Feature flags: bit 3 = Crank Revolution Data Supported.
-    // (Not bit 5 — that's a different bit table than the Measurement
-    // characteristic's Flags field, where bit 5 is Crank Revolution Data
-    // Present. Mixing the two tables up here meant we declared "Extreme
-    // Angles Supported" instead, which likely made strict clients like the
-    // Garmin Edge distrust/ignore the crank data we were actually sending.)
-    // ponytail: dropped the bit-9 "Offset Compensation Supported" claim we
-    // added earlier — it was false (we don't do offset compensation) and is
-    // exactly the kind of thing a strict client might notice and bail on.
-    // Testing whether the Edge's ~1.2s deliberate disconnect (reason=0x13,
-    // remote user terminated) traces to that lie, the Control Point, or DIS.
-    uint32_t featureFlags = 0x00000008;
+    // Feature flags (CPS Feature characteristic, 0x2A65):
+    //   bit 0 = Pedal Power Balance Supported (we repurpose for resistance %)
+    //   bit 3 = Crank Revolution Data Supported
+    uint32_t featureFlags = 0x00000009;
     cpsFeature->setValue(featureFlags);
 
     // Sensor Location — read (6 = Left Crank)
@@ -487,8 +483,8 @@ static void broadcastHeartbeatMulticast() {
     if (WiFi.status() != WL_CONNECTED) return;
     char payload[160];
     int len = snprintf(payload, sizeof(payload),
-                        "{\"timestamp\":%lu,\"cadence\":%u,\"power\":%d,\"resistance\":%u,\"rxBytes\":%lu}",
-                        (unsigned long)time(nullptr), currentCadence, currentPower, currentResistance, rxByteCount);
+                        "{\"timestamp\":%lu,\"cadence\":%u,\"power\":%d,\"resistance\":%u,\"rxBytes\":%lu,\"calib\":%u}",
+                        (unsigned long)time(nullptr), currentCadence, currentPower, currentResistance, rxByteCount, calibCount);
 
     sharedUdp.beginPacket(broadcastMulticastIp, MULTICAST_PORT);
     sharedUdp.write((const uint8_t*)payload, len);
@@ -520,17 +516,19 @@ static void broadcastBleMirror(const uint8_t* pkt, size_t len) {
 }
 
 static void notifyBLE() {
-    // CPS Measurement packet:
+    // CPS Measurement packet (9 bytes):
     //   uint16 flags
     //   int16  instantaneous power (watts)
-    //   uint16 cumulative crank revolutions   (if flags bit 5 set)
-    //   uint16 last crank event time (1/1024s) (if flags bit 5 set)
-    uint8_t pkt[8];
-    uint16_t flags = CPS_FLAGS_CRANK_DATA;
+    //   uint8  pedal power balance (repurposed: resistance % × 2, per CPS 0.5% resolution)
+    //   uint16 cumulative crank revolutions   (flags bit 5)
+    //   uint16 last crank event time (1/1024s) (flags bit 5)
+    uint8_t pkt[9];
+    uint16_t flags = CPS_FLAGS_CRANK_DATA | CPS_FLAGS_PEDAL_BALANCE;
     memcpy(pkt + 0, &flags,          2);
     memcpy(pkt + 2, &currentPower,   2);
-    memcpy(pkt + 4, &crankRevs,      2);
-    memcpy(pkt + 6, &lastCrankTime,  2);
+    pkt[4] = (uint8_t)(currentResistance * 2);  // 0-100% → 0-200 raw
+    memcpy(pkt + 5, &crankRevs,      2);
+    memcpy(pkt + 7, &lastCrankTime,  2);
 
     cpsMeasurement->setValue(pkt, sizeof(pkt));
     cpsMeasurement->notify();
@@ -579,6 +577,13 @@ static void sendPollRequest() {
     uint16_t sum = PKT_REQUEST_HEADER + cmd;
     uint8_t pkt[4] = {PKT_REQUEST_HEADER, cmd, (uint8_t)(sum & 0xFF), PKT_REQUEST_FOOTER};
     txByteCount += Serial2.write(pkt, sizeof(pkt));
+
+    // ponytail: log every 31st TX (~3 s) — 31 is not divisible by 3 so all cmds get logged
+    static uint8_t txLogCounter = 0;
+    if (++txLogCounter >= 31) {
+        txLogCounter = 0;
+        debugLog("[tx] cmd=0x%02X pkt=%02X %02X %02X %02X  (total tx=%lu)", cmd, pkt[0], pkt[1], pkt[2], pkt[3], txByteCount);
+    }
 }
 
 // Resistance calibration: the bike answers 31 (raw sensor value) points evenly
@@ -586,10 +591,29 @@ static void sendPollRequest() {
 // the 31 we're getting since that index is on the request line we don't see in
 // passive mode. Raw values are monotonically increasing with %, so keeping the
 // table sorted by raw value recovers the mapping without needing the index.
-// ponytail: if the bike boots before this firmware starts listening, this table
-// never fills and resistance stays 0 — fine for now (log-only, not sent over BLE).
+// Table is persisted to NVS so a bike reboot isn't required after first capture.
 static int32_t calibRaw[CALIBRATION_POINTS];
-static uint8_t calibCount = 0;
+
+static void saveCalibration() {
+    Preferences prefs;
+    prefs.begin("calib", false);
+    prefs.putBytes("raw", calibRaw, sizeof(calibRaw));
+    prefs.end();
+    debugLog("[calib] saved %u points to NVS", calibCount);
+}
+
+static void loadCalibration() {
+    Preferences prefs;
+    prefs.begin("calib", true);
+    size_t loaded = prefs.getBytes("raw", calibRaw, sizeof(calibRaw));
+    prefs.end();
+    if (loaded == sizeof(calibRaw)) {
+        calibCount = CALIBRATION_POINTS;
+        debugLog("[calib] loaded %u points from NVS", calibCount);
+    } else {
+        debugLog("[calib] no saved table — waiting for bike boot");
+    }
+}
 
 static void recordCalibrationPoint(int32_t raw) {
     if (calibCount >= CALIBRATION_POINTS) return;
@@ -601,6 +625,7 @@ static void recordCalibrationPoint(int32_t raw) {
     if (i > 0 && calibRaw[i - 1] == raw) return;  // duplicate point, discard
     calibRaw[i] = raw;
     calibCount++;
+    if (calibCount == CALIBRATION_POINTS) saveCalibration();
 }
 
 static uint8_t resistancePercent(int32_t raw) {
@@ -767,6 +792,7 @@ void setup() {
                   digitalRead(PELOTON_RX_PIN) ? "HIGH (floating/disconnected)" : "LOW (actively held down)");
 
     Serial2.begin(PELOTON_BAUD, SERIAL_8N1, PELOTON_RX_PIN, PELOTON_TX_PIN);
+    loadCalibration();
 
     setupBLE();
     setupOTA();
@@ -791,6 +817,7 @@ void loop() {
 
     if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = now;
+        badFrameCount = 0;  // reset so bad-frame dumps don't go permanently silent
         debugLog("[heartbeat] Cadence=%d RPM  Power=%d W  Resist=%d%%  TXbytes=%lu  RXbytes=%lu  GPIO%d=%s  Mode=%s  Jumper=%s  Built=%s",
                  currentCadence, currentPower, currentResistance, txByteCount, rxByteCount, PELOTON_RX_PIN,
                  digitalRead(PELOTON_RX_PIN) ? "HIGH" : "LOW",
